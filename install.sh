@@ -3,8 +3,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/CrazyMan28/vm-agent-mcp/main/install.sh | bash
 #
 # Installs uv + desktop deps + Tailscale (if missing), writes ~/.vm-agent/config.yaml,
-# grants the desktop user passwordless sudo, and runs vm-agent as a systemd service
-# that can see the desktop. Prints the one-liner to register this VM on your dev box.
+# for desktop users, optionally grants passwordless sudo; root installs directly
+# (including headless servers) without requiring sudo. Runs a systemd service
+# and prints the client registration command.
 #
 # Env knobs (all optional):
 #   VM_AGENT_TOKEN=...     use this bearer token instead of generating one
@@ -25,26 +26,34 @@ say()  { printf '\033[1;36m[vm-agent]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[vm-agent]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[vm-agent]\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] && die "Run as your normal desktop user, not root (the script uses sudo as needed)."
-command -v sudo >/dev/null || die "sudo is required."
-
 TARGET_USER="$(id -un)"
 USER_UID="$(id -u)"
+# Privileged operations run directly as root, or via sudo for desktop users.
+if [ "$USER_UID" -eq 0 ]; then
+  SUDO=()
+  say "Root install: the agent will run with full root privileges."
+else
+  command -v sudo >/dev/null || die "sudo is required for non-root installs."
+  SUDO=(sudo)
+fi
 
 # ---- 1. package manager + deps -------------------------------------------------
-if   command -v dnf >/dev/null; then PM="dnf";  INSTALL="sudo dnf install -y"
-elif command -v apt-get >/dev/null; then PM="apt"; INSTALL="sudo apt-get install -y"; sudo apt-get update -y
-elif command -v pacman >/dev/null; then PM="pacman"; INSTALL="sudo pacman -S --noconfirm"
+if   command -v dnf >/dev/null; then PM="dnf"; INSTALL=(dnf install -y)
+elif command -v apt-get >/dev/null; then PM="apt"; INSTALL=(apt-get install -y); "${SUDO[@]}" apt-get update -y
+elif command -v pacman >/dev/null; then PM="pacman"; INSTALL=(pacman -S --noconfirm)
 else die "Unsupported distro (need dnf, apt, or pacman)."; fi
 say "Package manager: $PM"
 
-# grim/ydotool/slurp = Wayland desktop; xclip = X11 clipboard; pciutils = GPU info.
 say "Installing system dependencies…"
-case "$PM" in
-  dnf)    $INSTALL git curl openssl wl-clipboard xclip grim slurp ydotool pciutils || warn "some deps missing" ;;
-  apt)    $INSTALL git curl openssl wl-clipboard xclip grim slurp ydotool pciutils || warn "some deps missing" ;;
-  pacman) $INSTALL git curl openssl wl-clipboard xclip grim slurp ydotool pciutils || warn "some deps missing" ;;
-esac
+"${SUDO[@]}" "${INSTALL[@]}" git curl openssl pciutils || die "Could not install required packages."
+# grim/ydotool/slurp = Wayland desktop; xclip = X11 clipboard.
+# A headless root-hosted server does not need desktop dependencies, some of
+# which may be unavailable in minimal Debian/Proxmox repositories.
+if [ "$USER_UID" -eq 0 ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+  say "Headless root install: skipping optional desktop input/screenshot packages."
+else
+  "${SUDO[@]}" "${INSTALL[@]}" wl-clipboard xclip grim slurp ydotool || warn "Some optional desktop packages are unavailable."
+fi
 
 # ---- 2. uv ---------------------------------------------------------------------
 if ! command -v uv >/dev/null && [ ! -x "$HOME/.local/bin/uv" ]; then
@@ -69,20 +78,27 @@ say "Resolving Python environment (uv sync)…"
 # ---- 4. Tailscale --------------------------------------------------------------
 if ! command -v tailscale >/dev/null; then
   say "Installing Tailscale…"
-  curl -fsSL https://tailscale.com/install.sh | sudo sh
+  curl -fsSL https://tailscale.com/install.sh | "${SUDO[@]}" sh
 fi
-sudo systemctl enable --now tailscaled 2>/dev/null || true
+"${SUDO[@]}" systemctl enable --now tailscaled 2>/dev/null || true
 if ! tailscale ip -4 >/dev/null 2>&1; then
   if [ -n "${TS_AUTHKEY:-}" ]; then
-    say "Bringing Tailscale up with auth key…"; sudo tailscale up --authkey "$TS_AUTHKEY"
+    say "Bringing Tailscale up with auth key…"; "${SUDO[@]}" tailscale up --authkey "$TS_AUTHKEY"
   else
     say "Bringing Tailscale up — open the URL below to authenticate:"
-    sudo tailscale up &
+    "${SUDO[@]}" tailscale up &
     for _ in $(seq 1 150); do tailscale ip -4 >/dev/null 2>&1 && break; sleep 2; done
   fi
 fi
 TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
-[ -n "$TS_IP" ] || warn "Could not detect Tailscale IP — finish 'sudo tailscale up' and re-read it later."
+[ -n "$TS_IP" ] || warn "Could not detect Tailscale IP — finish 'tailscale up' and rerun the installer."
+# Root-running remote shell access must not listen on every LAN interface.
+# Bind root installs only to Tailscale; if disconnected, stay on localhost.
+BIND_HOST="0.0.0.0"
+if [ "$USER_UID" -eq 0 ]; then
+  BIND_HOST="${TS_IP:-127.0.0.1}"
+  [ -n "$TS_IP" ] || warn "Root service will only listen locally until Tailscale is connected and the installer is rerun."
+fi
 
 # ---- 5. token + config ---------------------------------------------------------
 TOKEN="${VM_AGENT_TOKEN:-}"
@@ -94,7 +110,7 @@ fi
 mkdir -p "$CFG_DIR"
 cat > "$CFG" <<EOF
 bearer_token: $TOKEN
-mcp_host: 0.0.0.0
+mcp_host: $BIND_HOST
 mcp_port: $PORT
 max_output_chars: 100000
 EOF
@@ -102,17 +118,19 @@ chmod 600 "$CFG"
 say "Wrote $CFG"
 
 # ---- 6. passwordless sudo ------------------------------------------------------
-if [ "${NO_SUDOERS:-0}" != "1" ]; then
+if [ "$USER_UID" -eq 0 ]; then
+  say "Root already has elevated privileges; no sudoers entry needed."
+elif [ "${NO_SUDOERS:-0}" != "1" ]; then
   say "Granting $TARGET_USER passwordless sudo (so the agent's exec can use sudo)…"
   TMP="$(mktemp)"; echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" > "$TMP"
-  if sudo visudo -cf "$TMP" >/dev/null 2>&1; then
-    sudo install -m 0440 "$TMP" /etc/sudoers.d/vm-agent
+  if "${SUDO[@]}" visudo -cf "$TMP" >/dev/null 2>&1; then
+    "${SUDO[@]}" install -m 0440 "$TMP" /etc/sudoers.d/vm-agent
   else warn "sudoers validation failed — skipping (sudo will still prompt)."; fi
   rm -f "$TMP"
 fi
 
 # ---- 7. ydotoold (Wayland input) ----------------------------------------------
-if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v ydotoold >/dev/null; then
+if [ "$USER_UID" -ne 0 ] && [ -n "${WAYLAND_DISPLAY:-}" ] && command -v ydotoold >/dev/null; then
   mkdir -p "$HOME/.config/systemd/user"
   cat > "$HOME/.config/systemd/user/ydotoold.service" <<EOF
 [Unit]
@@ -130,7 +148,10 @@ fi
 # ---- 8. systemd service (sees the desktop) ------------------------------------
 say "Installing systemd service…"
 UNIT=/etc/systemd/system/vm-agent.service
-sudo tee "$UNIT" >/dev/null <<EOF
+# An SSH root session on a headless host should not advertise a fake :0 display.
+SERVICE_DISPLAY="${DISPLAY:-:0}"
+if [ "$USER_UID" -eq 0 ] && [ -z "${DISPLAY:-}" ]; then SERVICE_DISPLAY=""; fi
+"${SUDO[@]}" tee "$UNIT" >/dev/null <<EOF
 [Unit]
 Description=VM Agent MCP
 After=network-online.target graphical.target
@@ -139,7 +160,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$TARGET_USER
-Environment=DISPLAY=${DISPLAY:-:0}
+Environment=DISPLAY=$SERVICE_DISPLAY
 Environment=XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}
 Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}
 Environment=XDG_RUNTIME_DIR=/run/user/$USER_UID
@@ -153,19 +174,24 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-sudo systemctl daemon-reload
-sudo systemctl enable --now vm-agent.service
+"${SUDO[@]}" systemctl daemon-reload
+"${SUDO[@]}" systemctl enable --now vm-agent.service
 
 # ---- 9. firewall (best effort) -------------------------------------------------
-if command -v firewall-cmd >/dev/null; then sudo firewall-cmd --add-port="${PORT}/tcp" --permanent >/dev/null 2>&1 && sudo firewall-cmd --reload >/dev/null 2>&1 || true
-elif command -v ufw >/dev/null; then sudo ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true; fi
+if [ "$USER_UID" -eq 0 ]; then
+  say "Root mode: not opening a public firewall port; use the Tailscale interface."
+elif command -v firewall-cmd >/dev/null; then
+  "${SUDO[@]}" firewall-cmd --add-port="${PORT}/tcp" --permanent >/dev/null 2>&1 && "${SUDO[@]}" firewall-cmd --reload >/dev/null 2>&1 || true
+elif command -v ufw >/dev/null; then
+  "${SUDO[@]}" ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
+fi
 
 # ---- 10. verify + print client one-liner --------------------------------------
 sleep 3
-if curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+if curl -fsS -H "Authorization: Bearer $TOKEN" "http://${BIND_HOST/0.0.0.0/127.0.0.1}:${PORT}/health" >/dev/null 2>&1; then
   say "Server is up and healthy."
 else
-  warn "Health check failed — see: journalctl --user -u vm-agent -e  (or: sudo journalctl -u vm-agent -e)"
+  warn "Health check failed — see: journalctl -u vm-agent -e"
 fi
 
 NAME="vm-$(hostname -s 2>/dev/null || hostname)"
