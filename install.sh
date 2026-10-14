@@ -175,7 +175,10 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 "${SUDO[@]}" systemctl daemon-reload
-"${SUDO[@]}" systemctl enable --now vm-agent.service
+"${SUDO[@]}" systemctl enable vm-agent.service
+# enable --now alone does not restart an already running service after an
+# upgrade, which could leave it using a stale bind address/configuration.
+"${SUDO[@]}" systemctl restart vm-agent.service
 
 # ---- 9. firewall (best effort) -------------------------------------------------
 if [ "$USER_UID" -eq 0 ]; then
