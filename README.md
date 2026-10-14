@@ -19,6 +19,19 @@ second one-liner you run on your dev box to wire the VM into all three clients.
 curl -fsSL https://raw.githubusercontent.com/CrazyMan28/vm-agent-mcp/main/install.sh | bash
 ```
 
+**Root / headless Linux hosts (including Proxmox):** the same command works
+from a root SSH shell. No `sudo` binary or desktop session is required. It
+installs a system-level `vm-agent` service running as root, with configuration
+at `/root/.vm-agent/config.yaml`, and skips optional desktop packages. On
+headless servers, shell/files/services work but screenshot and keyboard/mouse
+tools are unavailable.
+
+For root installs, the MCP listener binds to the Tailscale IPv4 address rather
+than all network interfaces. If Tailscale isn't connected, it binds to
+`127.0.0.1` instead. Complete `tailscale up` and rerun the installer to
+expose the service on your tailnet. Check with
+`systemctl status vm-agent` or `journalctl -u vm-agent -e`.
+
 **Windows** (PowerShell — it self-elevates to Administrator):
 
 ```powershell
@@ -70,9 +83,13 @@ VM_AGENT_TOKEN=mytoken TS_AUTHKEY=tskey-auth-… \
 - **Transport:** HTTP streamable MCP at `/mcp`, `Authorization: Bearer <token>` on
   every request. `/health` is the only unauthenticated route. Reach it over
   Tailscale (default port **8800**).
-- **Linux:** a systemd **system** service runs as your desktop user with
-  `DISPLAY`/`XAUTHORITY`/`WAYLAND_DISPLAY` baked in, so screenshots and input hit
-  your real session. A `/etc/sudoers.d/vm-agent` drop-in gives passwordless sudo.
+- **Linux (regular user):** a systemd **system** service runs as your desktop
+  user with `DISPLAY`/`XAUTHORITY`/`WAYLAND_DISPLAY` baked in, so screenshots
+  and input hit your real session. A `/etc/sudoers.d/vm-agent` drop-in gives
+  passwordless sudo unless `NO_SUDOERS=1`.
+- **Linux (root):** the system service runs as root without `sudo` or a sudoers
+  drop-in. Headless root installs don't inject a fake X11 display, and the
+  listener binds to Tailscale (or localhost until Tailscale is connected).
 - **Windows:** a Scheduled Task at logon, **Interactive + highest privileges**, so
   it has admin rights and can see the real desktop (not Session 0).
 - **Desktop backends** are auto-detected: `mss` (X11/Windows) or `grim` (Wayland)
@@ -100,7 +117,10 @@ Windows: restart the `vm-agent-mcp` task in Task Scheduler.
 This grants full remote control of the machine to anyone holding the bearer token
 — including passwordless sudo / local admin. Only install on machines you own,
 keep the token secret, and rely on Tailscale (not a public IP) for reachability.
-The passwordless-sudo drop-in can be skipped on Linux with `NO_SUDOERS=1`.
+The passwordless-sudo drop-in can be skipped for non-root Linux installs with
+`NO_SUDOERS=1`. Root installs already have unrestricted local privileges: a
+stolen bearer token gives **full root access**. Avoid forwarding port 8800 to
+the public internet; keep Tailscale access tightly controlled.
 
 ## Local development
 
